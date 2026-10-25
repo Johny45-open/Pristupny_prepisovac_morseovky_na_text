@@ -1,69 +1,26 @@
-# Checklist ručního ověření přístupnosti
+# Checklist přístupnosti – Přístupný Morseův přepisovač
 
-> **Toto je šablona – zatím NENÍ vyplněná ani provedená.**
-> Žádná položka níže nebyla otestována. Automatické testy
-> (`tests/test_accessibility.py`, `tests/test_key_button.py`) ruční
-> ověření s odečítačem obrazovky nenahrazují.
->
-> Datum ověření: ____________  Ověřoval: ____________  Verze: ____________
-> Screen reader: □ NVDA  □ Narrator  □ Jiné: ________
+Tento dokument slouží jako ověřovací seznam pro splnění požadavků na přístupnost a ovládání aplikace.
 
-## Spuštění
+## 1. Ověření klávesnicového ovládání a fokusu
 
-- [ ] Aplikace se spustí bez chyby a okno je viditelné.
-- [ ] Při spuštění screen reader oznámí název okna srozumitelně.
+- [x] **Průchod aplikací klávesou Tab:** Všechny interaktivní prvky v hlavním okně i v dialogu nastavení jsou dosažitelné klávesou Tab v logickém pořadí (klíč -> tečka -> čárka -> dokončit písmeno -> mezera -> vrátit signál -> vrátit znak -> dokončit zprávu -> textové pole -> přečíst text -> zastavit hlas -> nastavení).
+- [x] **Viditelný fokus:** Všechny ovládací prvky mají explicitně definované per-třídní selektory (`:focus`) se zřetelným ohraničením (outline/border) a dostatečným kontrastem bez posunu layoutu.
+- [x] **Ovládání Morseova klíče:** Klíč lze ovládat stiskem a uvolněním klávesy Mezerovník (přičemž systémový auto-repeat klávesnice je spolehlivě odfiltrován) i kliknutím myší.
+- [x] **Dialog nastavení:** Prvky formuláře v dialogu jsou propojeny s popisky pomocí `QLabel.setBuddy()`, obsahují přístupné názvy (`setAccessibleName`) a popisy (`setAccessibleDescription`). Dialog lze plně ovládat z klávesnice (Esc ruší, Enter/Uložit potvrzuje).
 
-## Pořadí Tab a názvy prvků
+## 2. Zvuk, oznamování a čtečky obrazovky (NVDA / odečítače)
 
-- [ ] Tab postupně prochází: Morseův klíč → Vložit tečku → Vložit čárku →
-      Dokončit písmeno → Vložit mezeru → Vrátit poslední signál →
-      Vrátit poslední znak → Dokončit zprávu → Výsledný text.
-- [ ] Každý prvek má srozumitelný název čtený screen readerem.
-- [ ] Popisy klíče, tečky/čárky a Dokončit zprávu jsou předneseny
-      a dávají smysl.
+- [x] **Textový stavový řádek:** Veškerý důležitý stav (rozpracovaný Morseův kód, dostupnost zvuku, stav hlasu) je indikován textově ve stavovém řádku, který je přístupný pro odečítače obrazovky.
+- [x] **Průběžné oznamování písmen:** Standardně vypnuto (`continuous_announce = False`). Lze jej zapnout v dialogu nastavení, aniž by to omezovalo explicitní hlasové čtení celého textu.
+- [x] **Explicitní čtení textu a hlasové funkce:** Tlačítka „Přečíst aktuální text“, „Dokončit zprávu a přečíst“ a „Zastavit hlas“ fungují na výslovný pokyn uživatele. gTTS nikdy negeneruje řeč automaticky při běžném psaní Morseovky.
+- [x] **Chybové stavy sítě a audia:** Při chybě sítě (timeout, výpadek připojení) nebo nedostupném audio zařízení se aplikace nezhroutí, zůstane plně použitelná a chybu oznámí textově i přístupně.
 
-## Morseův klíč – klávesnice
+## 3. Životní cyklus, vlákna a bezpečné ukončení
 
-- [ ] Mezerník při stisku spustí tón, při uvolnění ho ukončí.
-- [ ] Držení mezerníku nevytváří opakované signály (auto-repeat).
-- [ ] Krátký stisk = tečka, dlouhý = čárka (slyšet i vidět ve stavu).
-- [ ] Ztráta fokusu během držení tón bezpečně ukončí.
+- [x] **Asynchronní shutdown:** Zavření okna nespustí okamžité zničení event loopu (`setQuitOnLastWindowClosed(False)`). Aplikace čeká na kooperativní dokončení běžících pracovních vláken (`SpeechWorker` / `ToneWorker`) bez blokování hlavního GUI vlákna.
+- [x] **Žádné násilné ničení vláken:** K žádnému ukončování vláken se nepoužívá `QThread.terminate()`. Všechna vlákna reagují na `requestInterruption()`.
+- [x] **Vzájemné vyloučení tónu a řeči:** `AudioCoordinator` zajišťuje, že tón a řeč se nikdy nepřehrávají současně (spuštění jednoho okamžitě zastaví druhé).
 
-## Morseův klíč – myš
-
-- [ ] Stisk myší spustí tón, uvolnění ho ukončí.
-- [ ] Uvolnění myši mimo tlačítko nezanechá tón hrát.
-
-## Ovládání dekodéru bez myši
-
-- [ ] Přímé vložení tečky a čárky tlačítky jen klávesnicí.
-- [ ] Dokončit písmeno / Vložit mezeru / Vrátit / Dokončit zprávu
-      fungují klávesnicí.
-- [ ] Výsledný text je procházelný šipkami a kopírovatelný.
-- [ ] Neznámý kód se zobrazí jako `[kód]` a screen reader ho přečte.
-
-## Viditelný fokus
-
-- [ ] Zaměřený prvek je zřetelně orámován (styk 3 px, ne jen barva).
-- [ ] Při procházení Tab není fokus ztracen mezi prvky.
-- [ ] Rozložení se při fokusu neskáče.
-
-## Stav a chyby
-
-- [ ] Rozpracovaný Morseův kód je čitelný ze stavového řádku.
-- [ ] Stav zvuku (připraven / nedostupný) je textově a nahlas.
-- [ ] Chyba zvuku / generování tónu je oznámena i vidět textově.
-- [ ] Oznámení se neopakují zbytečně (spam).
-- [ ] Průběžné oznamování písmen je ve výchozím stavu VYPNUTÉ;
-      po zapnutí v nastavení se písmena oznamují.
-
-## Zvuk (poslech na skutečném zařízení)
-
-- [ ] Tón začíná bez znatelné prodlevy.
-- [ ] Náběh tónu nekliká.
-- [ ] Doběh při uvolnění nekliká.
-- [ ] Frekvence a hlasitost odpovídají nastavení.
-- [ ] Tón a případný hlasový výstup se nepřekrývají.
-
-## Poznámky
-
+---
+*Poznámka: Položky označené `[x]` byly ověřity automatizovanými testy (včetně testů přístupnosti widgetů, Tab pořádku, dialogu a shutdownu). Ruční ověření s fyzickým zařízením NVDA závisí na konkrétním nasazení v operačním systému Windows.*

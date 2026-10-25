@@ -55,7 +55,9 @@ from PyQt6.QtWidgets import (
 from .announce import Announcer
 from .audio import AudioCoordinator
 from .decoder import DASH_SYMBOL, DOT_SYMBOL, DecodeStatus, Decoder
-from .settings_store import Settings
+from .settings_dialog import SettingsDialog
+from .settings_store import Settings, SettingsStore
+from .shutdown import ApplicationShutdown
 from .speech import SpeechCache, SpeechWorker
 from .style_sheet import APP_STYLESHEET
 from .tone_worker import ToneBlock, ToneWorker
@@ -215,6 +217,13 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self.stop_speech_button)
 
+        # 13) Tlačítko Nastavení (E5)
+        self.settings_button = QPushButton("Nastavení")
+        self.settings_button.setAccessibleDescription(
+            "Otevře dialog nastavení parametrů zvuku a časování."
+        )
+        layout.addWidget(self.settings_button)
+
         # 10) Stavový řádek (textový, odečitatelný)
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
@@ -226,7 +235,7 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-        # Explicitní pořadí Tab (včetně hlasových ovládacích prvků E4).
+        # Explicitní pořadí Tab (včetně hlasových ovládacích prvků E4 a Nastavení E5).
         order = [
             self.key_button,
             self.dot_button,
@@ -239,6 +248,7 @@ class MainWindow(QMainWindow):
             self.text_edit,
             self.read_button,
             self.stop_speech_button,
+            self.settings_button,
         ]
         for first, second in zip(order, order[1:]):
             self.setTabOrder(first, second)
@@ -269,6 +279,7 @@ class MainWindow(QMainWindow):
         self.finish_message_button.clicked.connect(self._on_finish_message)
         self.read_button.clicked.connect(self._on_read_clicked)
         self.stop_speech_button.clicked.connect(self._on_stop_speech)
+        self.settings_button.clicked.connect(self._on_settings_clicked)
 
         # Signály koordinátoru k řeči; hasattr chrání starší fake
         # koordinátory (testy E3), které rozhraní řeči nemají.
@@ -532,6 +543,34 @@ class MainWindow(QMainWindow):
         self._announcer.say(text, force=True)
         self._update_status()
 
+    def _on_settings_clicked(self) -> None:
+        """Otevře dialog nastavení, po uložení aktualizuje nastavení a aplikuje je."""
+        dialog = SettingsDialog(self._settings, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_settings = dialog.settings
+            # Uložit do trvalého uložiště
+            store = SettingsStore()
+            store.save(new_settings)
+
+            old_freq = self._settings.tone_frequency_hz
+            self._settings = new_settings
+
+            # Aplikovat do dekodéru
+            self._decoder.letter_gap_ms = new_settings.letter_gap_ms
+            self._decoder.auto_word_space = new_settings.auto_word_space
+            self._decoder.auto_word_gap_ms = new_settings.auto_word_gap_ms
+            self._letter_timer.setInterval(int(new_settings.letter_gap_ms))
+
+            # Aplikovat do průběžného oznamování
+            self._announcer.char_announcements_enabled = new_settings.continuous_announce
+
+            # Pokud se změnila frekvence, připravit nový tónový blok
+            if new_settings.tone_frequency_hz != old_freq:
+                self._start_audio_preparation()
+
+            self._announcer.say("Nastavení bylo uloženo.", force=True)
+            self._update_status()
+
     # ------------------------------------------------------------------
     # Stav
     # ------------------------------------------------------------------
@@ -570,14 +609,33 @@ class MainWindow(QMainWindow):
         return super().event(ev)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        # Ukončení zvuku při zavření (úplný asynchronní shutdown až v E5).
+        """Asynchronní řízené ukončení (etapa E5).
+
+        Zabrání vícenásobnému spuštění shutdownu, skryje okno,
+        zastaví tón a řeč a předá živá vlákna do ApplicationShutdown,
+        který čeká na jejich dokončení bez blokování event loopu.
+        """
+        if self._stopping:
+            event.accept()
+            return
+
         self._stopping = True
         self.key_button.cancel_press()
-        # Zneplatnit hlas a přerušit generování; běžící vlákna se
-        # NEZNIČÍ – dokud neskončí, drží je _speech_threads.
-        # Na jejich dokončení musí před zničením okna počkat
-        # shutdown.py z E5.
         self._invalidate_speech_request(interrupt=True)
-        self._coordinator.stop_now()
-        self._coordinator.shutdown()
-        super().closeEvent(event)
+
+        app = QApplication.instance()
+        if app is not None:
+            # Skrýt okno ihned, ale nezavírat event loop dokud shutdown neskončí
+            self.hide()
+            shutdown = ApplicationShutdown(
+                app=app,
+                coordinator=self._coordinator,
+                threads=self._speech_threads,
+            )
+            shutdown.start_shutdown()
+            event.ignore()  # Event loop běží dál, QApplication.quit() zavolá shutdown
+        else:
+            # Fallback pro testy bez QApplication instance
+            self._coordinator.stop_now()
+            self._coordinator.shutdown()
+            event.accept()
