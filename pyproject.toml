@@ -1,0 +1,10 @@
+[project]
+name = "pristupny-morse-prepisovac"
+version = "0.0.0"
+description = "Přístupný Windows přepisovač Morseovy abecedy na text (PyQt6)"
+requires-python = ">=3.13"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

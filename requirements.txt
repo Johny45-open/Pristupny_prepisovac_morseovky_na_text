@@ -1,0 +1,9 @@
+# Povinné běžné závislosti (již nainstalované v prostředí)
+PyQt6
+accessible_output2
+gTTS
+pygame
+
+# Testovací závislosti
+pytest
+pytest-qt
