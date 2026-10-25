@@ -1,27 +1,39 @@
-"""Hlavní okno přístupného Morseova přepisovače (PyQt6, etapa E3).
+"""Hlavní okno přístupného Morseova přepisovače (PyQt6, etapy E3 + E4).
 
 Propojuje:
 
 - ``Decoder`` – dekódovací logika; čas mu předává ``QTimer``
   (``_letter_timer``) voláním ``tick(now_ms)``; žádné ``sleep()``;
 - ``ToneWorker`` – generování PCM mimo GUI vlákno (``QThreadPool``);
-- ``AudioCoordinator`` – jediný vlastník pygame mixeru;
+- ``AudioCoordinator`` – jediný vlastník pygame mixeru (tón i řeč);
+- ``SpeechWorker`` (E4) – generování MP3 přes gTTS v ``QThread``,
+  mimo GUI vlákno; síťové požadavky nikdy neběží v GUI vlákně;
 - ``Announcer`` – přístupná oznámení (průběžné oznamování písmen
   standardně **vypnuto**).
 
 Rozhraní: Morseův klíč, přímé tlačítko tečky/čárky, dokončit písmeno,
-mezera, vrátit signál, vrátit znak, dokončit zprávu, pole výsledného
-textu (QTextEdit pouze pro čtení, procházetelné a kopírovatelné) a
-textový stavový řádek. Žádný důležitý stav není jen barevně ani jen
-zvukem – vše je textově ve stavovém řádku.
+mezera, vrátit signál, vrátit znak, Dokončit zprávu a přečíst, pole
+výsledného textu (QTextEdit pouze pro čtení, procházetelné a
+kopírovatelné), Přečíst aktuální text, Zastavit hlas a textový
+stavový řádek. Žádný důležitý stav není jen barevně ani jen zvukem –
+vše je textově ve stavovém řádku.
 
-Zvuk: při startu se inicializuje koordinátor a spustí se příprava
-výchozího tónu. Pokud tón ještě není připravený nebo zvuk není
-dostupný, je klíč **dočasně zakázán** a důvod je zobrazen ve stavu
-i oznámen – stisk se netichu ignoruje.
+Hlas (E4):
 
-V E3 nejsou tlačítka hlasového čtení (gTTS přijde v E4) ani dialog
-nastavení (E5).
+- řeč se generuje **jen na výslovný pokyn** (tlačítka), nikdy při
+  každé změně textu; prázdný text se do sítě neposílá;
+- každému požadavku odpovídá jedno ID; výsledek se uplatní **jen při
+  shodě ID** – zastaralý výsledek se nepřehraje ani nepřepíše stav;
+- ``Zastavit hlas`` okamžitě zastaví přehrávání a přeruší generování
+  (kooperativní ``requestInterruption``; nezruší právě běžící HTTP –
+  ten končí timeoutem 5 s);
+- stisk Morseova klíče zneplatní čekající požadavek, aby se starý
+  výsledek později nepřehrál;
+- běžící ``QThread`` se nikdy nezničí – reference se drží
+  v ``_speech_threads`` až do signálu ``finished`` (úplné řízené
+  zavření s čekáním na vlákna doplní ``shutdown.py`` v E5).
+
+V E4 není dialog nastavení (E5) ani centrální ``shutdown.py`` (E5).
 """
 
 from __future__ import annotations
@@ -44,12 +56,18 @@ from .announce import Announcer
 from .audio import AudioCoordinator
 from .decoder import DASH_SYMBOL, DOT_SYMBOL, DecodeStatus, Decoder
 from .settings_store import Settings
+from .speech import SpeechCache, SpeechWorker
 from .style_sheet import APP_STYLESHEET
 from .tone_worker import ToneBlock, ToneWorker
 from .widgets.key_button import KeyButton
 
 # Bezpečná (neběžná) záloha frekvence, pokud se nastavení načíst nepovede.
 DEFAULT_FREQUENCY_HZ = 600
+
+
+def _default_speech_factory(request_id: int, text: str, cache: SpeechCache):
+    """Výchozí tvorba hlasového pracovníka (síť běží ve vlákne)."""
+    return SpeechWorker(request_id, text, cache)
 
 
 class MainWindow(QMainWindow):
@@ -63,8 +81,13 @@ class MainWindow(QMainWindow):
         settings: Settings | None = None,
         coordinator: AudioCoordinator | None = None,
         announcer: Announcer | None = None,
+        speech_factory=None,
         parent=None,
     ) -> None:
+        """``speech_factory(request_id, text, cache)`` vrací pracovníka
+        se signály ``completed/error/interrupted``, ``finished``,
+        ``start()`` a ``requestInterruption()`` – testy sem dodají
+        fake a nedotýkají se sítě."""
         super().__init__(parent)
         self._settings = settings if settings is not None else Settings()
         self._announcer = announcer if announcer is not None else Announcer()
@@ -84,6 +107,13 @@ class MainWindow(QMainWindow):
         self._tone_ready_flag = False
         self._stopping = False
         self._status_parts: dict[str, str] = {}
+
+        # Hlas (E4): cache jen v paměti, ID požadavků, živá vlákna.
+        self._speech_cache = SpeechCache()
+        self._speech_factory = speech_factory or _default_speech_factory
+        self._speech_request_counter = 0
+        self._active_speech_request_id: int | None = None
+        self._speech_threads: list[QThread] = []  # reference až do finished
 
         self._build_ui()
         self._connect_signals()
@@ -147,10 +177,11 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self.back_char_button)
 
-        # 8) Dokončit zprávu
-        self.finish_message_button = QPushButton("Dokončit zprávu")
+        # 8) Dokončit zprávu a přečíst (E4: dokončí znak a přečte text)
+        self.finish_message_button = QPushButton("Dokončit zprávu a přečíst")
         self.finish_message_button.setAccessibleDescription(
-            "Zpracuje poslední rozpracovaný znak a ukončí zprávu."
+            "Zpracuje poslední rozpracovaný znak, ukončí zprávu a "
+            "nechá ji přečíst hlasem."
         )
         layout.addWidget(self.finish_message_button)
 
@@ -167,6 +198,23 @@ class MainWindow(QMainWindow):
         layout.addWidget(text_label)
         layout.addWidget(self.text_edit)
 
+        # 11–12) Hlasové ovládání (E4) – až za textovým polem, aby
+        # zůstal zachovaný dosavadní pořadí Tab (text navazuje na
+        # Dokončit zprávu a přečíst) a řeč šla ovládat hned po poli.
+        self.read_button = QPushButton("Přečíst aktuální text")
+        self.read_button.setAccessibleDescription(
+            "Přečte výsledný text hlasem. Převod je online a spustí "
+            "se jen při stisku tohoto tlačítka."
+        )
+        layout.addWidget(self.read_button)
+
+        self.stop_speech_button = QPushButton("Zastavit hlas")
+        self.stop_speech_button.setAccessibleDescription(
+            "Okamžitě zastaví právě přehrávaný hlas a přeruší "
+            "probíhající generování."
+        )
+        layout.addWidget(self.stop_speech_button)
+
         # 10) Stavový řádek (textový, odečitatelný)
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
@@ -178,7 +226,7 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-        # Explicitní pořadí Tab (jen existující prvky E3).
+        # Explicitní pořadí Tab (včetně hlasových ovládacích prvků E4).
         order = [
             self.key_button,
             self.dot_button,
@@ -189,6 +237,8 @@ class MainWindow(QMainWindow):
             self.back_char_button,
             self.finish_message_button,
             self.text_edit,
+            self.read_button,
+            self.stop_speech_button,
         ]
         for first, second in zip(order, order[1:]):
             self.setTabOrder(first, second)
@@ -217,6 +267,17 @@ class MainWindow(QMainWindow):
         self.back_symbol_button.clicked.connect(self._on_back_symbol)
         self.back_char_button.clicked.connect(self._on_back_char)
         self.finish_message_button.clicked.connect(self._on_finish_message)
+        self.read_button.clicked.connect(self._on_read_clicked)
+        self.stop_speech_button.clicked.connect(self._on_stop_speech)
+
+        # Signály koordinátoru k řeči; hasattr chrání starší fake
+        # koordinátory (testy E3), které rozhraní řeči nemají.
+        speech_finished = getattr(self._coordinator, "speech_finished", None)
+        if speech_finished is not None:
+            speech_finished.connect(self._on_speech_playback_finished)
+        speech_failed = getattr(self._coordinator, "speech_failed", None)
+        if speech_failed is not None:
+            speech_failed.connect(self._on_speech_playback_failed)
 
     # ------------------------------------------------------------------
     # Zvuk
@@ -268,6 +329,9 @@ class MainWindow(QMainWindow):
             self._announcer.say("Tón ještě není připraven.", force=True)
             self._update_status()
             return
+        # Stisk klíče zneplatní čekající hlasový požadavek – jeho
+        # opožděný výsledek se už nikdy nepřehraje.
+        self._invalidate_speech_request(interrupt=True)
         self._coordinator.start_tone(
             volume=self._settings.tone_volume / 100.0
         )
@@ -326,11 +390,14 @@ class MainWindow(QMainWindow):
         self.text_edit.moveCursor(QTextCursor.MoveOperation.End)
 
     def _on_finish_message(self) -> None:
+        """Dokončí poslední znak, aktualizuje text a teprve potom čte."""
         self._letter_timer.stop()
         result = self._decoder.finish_message(self._now_ms())
         self._apply_result(result)
         self._update_status()
         self._announcer.say("Zpráva dokončena.")
+        # Čte se až skutečně aktuální text po dokončení znaku.
+        self._request_speech(self._decoder.text)
 
     def _apply_result(self, result) -> None:
         """Aktualizuje text a volitelně oznámí dokončené písmeno."""
@@ -340,6 +407,130 @@ class MainWindow(QMainWindow):
             self._announcer.say_char(result.char)
         elif result.status is DecodeStatus.UNKNOWN and result.code:
             self._announcer.say(f"Neznámý kód: {result.code}")
+
+    # ------------------------------------------------------------------
+    # Hlas (E4)
+    # ------------------------------------------------------------------
+
+    def _on_read_clicked(self) -> None:
+        """Explicitní pokyn – jediný způsob, jak se text dostane do gTTS."""
+        self._request_speech(self._decoder.text)
+
+    def _request_speech(self, text: str) -> None:
+        """Zahájí generování řeči; volá se **jen** z tlačítek.
+
+        Prázdný text se do sítě neposílá (žádný worker nevznikne).
+        Nový požadavek zneplatní starší – jeho výsledek se při shodě
+        ID neuplatní.
+        """
+        if self._stopping:
+            return
+        clean = (text or "").strip()
+        if not clean:
+            # Žádný síťový požadavek, srozumitelné přístupné oznámení.
+            self._invalidate_speech_request(interrupt=True)
+            self._set_status_part("hlas", "Text je prázdný – není co číst.")
+            self._announcer.say("Text je prázdný, není co číst.", force=True)
+            self._update_status()
+            return
+
+        self._invalidate_speech_request(interrupt=True)
+        self._speech_request_counter += 1
+        request_id = self._speech_request_counter
+        self._active_speech_request_id = request_id
+
+        worker = self._speech_factory(request_id, text, self._speech_cache)
+        worker.signals.completed.connect(self._on_speech_completed)
+        worker.signals.error.connect(self._on_speech_error)
+        worker.signals.interrupted.connect(self._on_speech_interrupted)
+        # Reference až do skutečného konce – nikdy nezničit běžící vlákno.
+        # Bound metoda (ne lambda): PyQt sleduje receiver a při zničení
+        # okna se bezpečně odpojí.
+        self._speech_threads.append(worker)
+        worker.finished.connect(self._on_speech_thread_finished)
+
+        self._set_status_part("hlas", "Generování hlasu…")
+        self._update_status()
+        worker.start()
+
+    def _invalidate_speech_request(self, interrupt: bool = True) -> None:
+        """Zneplatní aktivní požadavek (výsledek se nepřehraje).
+
+        ``interrupt=True`` navíc požádá běžící vlákna o kooperativní
+        přerušení (HTTP to nezruší – ten doběhne timeoutem 5 s).
+        """
+        self._active_speech_request_id = None
+        if not interrupt:
+            return
+        for worker in list(self._speech_threads):
+            try:
+                worker.requestInterruption()
+            except Exception:
+                pass  # dokončené vlákno je bezpečné ignorovat
+
+    def _on_speech_thread_finished(self) -> None:
+        """Úklid až po skutečném ``finished`` – vlákno se nezničilo dřív."""
+        worker = self.sender()
+        if worker is None:
+            return
+        if worker in self._speech_threads:
+            self._speech_threads.remove(worker)
+        try:
+            worker.deleteLater()
+        except Exception:
+            pass
+
+    def _on_speech_completed(self, request_id: int, data: bytes) -> None:
+        """Úspěch – jen při shodě ID; zastaralý výsledek se nepřehraje."""
+        if self._stopping or request_id != self._active_speech_request_id:
+            return
+        volume = self._settings.speech_volume / 100.0
+        if self._coordinator.play_speech(request_id, data, volume):
+            self._set_status_part("hlas", "Hlas se přehrává.")
+        self._update_status()
+
+    def _on_speech_error(self, request_id: int, message: str) -> None:
+        """Chyba sítě/gTTS – textově i přístupně; zastaralé ID se tiše ignoruje."""
+        if self._stopping or request_id != self._active_speech_request_id:
+            return  # opožděná chyba zrušeného požadavku se neoznamuje
+        self._active_speech_request_id = None
+        text = f"Hlasový převod se nepodařil: {message}"
+        self._set_status_part("hlas", text)
+        self._announcer.say(text, force=True)
+        self._update_status()
+
+    def _on_speech_interrupted(self, request_id: int) -> None:
+        """Přerušení je běžný průběh – žádná chyba, jen úklid stavu."""
+        if request_id == self._active_speech_request_id:
+            self._active_speech_request_id = None
+            self._set_status_part("hlas", "Generování hlasu přerušeno.")
+            self._update_status()
+
+    def _on_stop_speech(self) -> None:
+        """Okamžitě zastaví přehrávání i generování (bez čekání na síť)."""
+        self._invalidate_speech_request(interrupt=True)
+        self._coordinator.stop_speech()
+        self._set_status_part("hlas", "Hlas zastaven.")
+        self._announcer.say("Hlas zastaven.")
+        self._update_status()
+
+    def _on_speech_playback_finished(self, request_id: int) -> None:
+        """Konec přehrávání z koordinátoru – jen aktuální požadavek."""
+        if request_id != self._active_speech_request_id:
+            return  # zastaralé ID nesmí změnit stav
+        self._active_speech_request_id = None
+        self._set_status_part("hlas", "Hlas dokončen.")
+        self._update_status()
+
+    def _on_speech_playback_failed(self, request_id: int, message: str) -> None:
+        """Chyba dekódování/přehrávání MP3 v koordinátoru."""
+        if request_id != self._active_speech_request_id:
+            return
+        self._active_speech_request_id = None
+        text = f"Chyba přehrávání hlasu: {message}"
+        self._set_status_part("hlas", text)
+        self._announcer.say(text, force=True)
+        self._update_status()
 
     # ------------------------------------------------------------------
     # Stav
@@ -382,6 +573,11 @@ class MainWindow(QMainWindow):
         # Ukončení zvuku při zavření (úplný asynchronní shutdown až v E5).
         self._stopping = True
         self.key_button.cancel_press()
+        # Zneplatnit hlas a přerušit generování; běžící vlákna se
+        # NEZNIČÍ – dokud neskončí, drží je _speech_threads.
+        # Na jejich dokončení musí před zničením okna počkat
+        # shutdown.py z E5.
+        self._invalidate_speech_request(interrupt=True)
         self._coordinator.stop_now()
         self._coordinator.shutdown()
         super().closeEvent(event)

@@ -8,10 +8,18 @@ tento objekt.
 Všechna volání mixeru probíhají v jediném vlákně vlastníka – v hlavním
 GUI vlákně. Koordinátor se volá jen z GUI vlákna.
 
-Stavový stroj (E2 implementuje ``IDLE`` a ``TONE``; ``SPEECH`` je
-vyhrazen pro E4, architektura ho bezpečně doplní):
+Stavový stroj (E4 doplňuje ``SPEECH``):
 
     IDLE --start_tone()--> TONE --release_tone()/stop_now()--> IDLE
+    IDLE --play_speech()--> SPEECH --dohrání/stop_speech()--> IDLE
+
+Vzájemné vyloučení: zahájení řeči zastaví tón; zahájení tónu zastaví
+řeč. Tón a řeč nikdy nehrají současně. Přehrávání řeči využívá
+``pygame.mixer.music`` (odděleně od ``Channel`` pro tón) – všechna
+volání ale zůstávají **jen uvnitř** tohoto koordinátoru. Konec
+přehrávání řeči (``music`` není Qt signál) detekuje ``QTimer``
+s ``get_busy()`` a generační číslo – zastaralý callback nikdy nezmění
+stav novějšího přehrávání.
 
 Řešení rychlých posloupností (stisk–uvolnění–stisk): každé spuštění nebo
 zastavení tónu zvýší ``generation``; časovače náležející starší generaci
@@ -31,6 +39,7 @@ popisuje příčinu a všechny operace tónu jsou bezpečné no-op s návratem
 
 from __future__ import annotations
 
+import io
 from enum import Enum, auto
 from typing import Callable
 
@@ -46,13 +55,16 @@ DEFAULT_FADE_OUT_MS = 20     # ~15–30 ms
 # Index vyhrazeného kanálu pro Morseův tón.
 TONE_CHANNEL = 0
 
+# Kontrola konce přehrávání řeči (pygame.mixer.music není Qt signál).
+SPEECH_POLL_MS = 100
+
 
 class AudioState(Enum):
     """Stav audio enginu."""
 
     IDLE = auto()    # nic nehraje
     TONE = auto()    # hraje Morseův tón
-    SPEECH = auto()  # vyhrazeno pro E4 (řeč); v E2 se nepoužívá
+    SPEECH = auto()  # hraje řeč z gTTS (pygame.mixer.music)
 
 
 class AudioCoordinator(QObject):
@@ -62,6 +74,8 @@ class AudioCoordinator(QObject):
     availability_changed = pyqtSignal(bool)   # True = zvuk dostupný
     tone_started = pyqtSignal()
     tone_stopped = pyqtSignal()
+    speech_finished = pyqtSignal(int)         # request_id – řeč dohrála
+    speech_failed = pyqtSignal(int, str)      # request_id, příčina
 
     def __init__(
         self,
@@ -70,12 +84,15 @@ class AudioCoordinator(QObject):
         fade_in_ms: int = DEFAULT_FADE_IN_MS,
         fade_in_steps: int = DEFAULT_FADE_IN_STEPS,
         fade_out_ms: int = DEFAULT_FADE_OUT_MS,
+        music=None,
     ) -> None:
-        """``mixer`` a ``timer_factory`` existují pro testování s mocky.
+        """``mixer``, ``music`` a ``timer_factory`` existují pro testování
+        s mocky.
 
-        V produkci se předá ``pygame.mixer`` (výchozí) a vytvářejí se
-        skutečné ``QTimer``. Testy předají fake mixer a fake časovač,
-        takže nepotřebují fyzické audio zařízení ani Qt event loop.
+        V produkci se předá ``pygame.mixer`` (výchozí), ``music`` je
+        ``pygame.mixer.music`` (dopočítá se) a vytvářejí se skutečné
+        ``QTimer``. Testy předají fakes, takže nepotřebují fyzické audio
+        zařízení ani Qt event loop.
         """
         super().__init__()
         if fade_in_ms < 0 or fade_out_ms < 0:
@@ -85,7 +102,13 @@ class AudioCoordinator(QObject):
         if mixer is None:
             import pygame.mixer as _mixer
             mixer = _mixer
+        if music is None:
+            # v pygame 2.6 je music dostupné jako atribut mixer.music
+            # (interně pygame.mixer_music), ne jako importovatelný modul.
+            import pygame.mixer as _mixer_for_music
+            music = _mixer_for_music.music
         self._mixer = mixer
+        self._music = music
         self._timer_factory = timer_factory or QTimer
         self._fade_in_ms = int(fade_in_ms)
         self._fade_in_steps = int(fade_in_steps)
@@ -101,6 +124,10 @@ class AudioCoordinator(QObject):
         self._generation = 0          # ochrana před zastaralými časovači
         self._fade_timer: QTimer | None = None
         self._fade_step = 0
+        # Řeč: životnost BytesIO musí trvat po dobu přehrávání.
+        self._speech_timer: QTimer | None = None
+        self._speech_request_id: int | None = None
+        self._speech_stream: io.BytesIO | None = None
 
     # ------------------------------------------------------------------
     # Stav
@@ -150,7 +177,7 @@ class AudioCoordinator(QObject):
         return True
 
     def shutdown(self) -> None:
-        """Bezpečné ukončení: zastaví tón a uvolní mixer.
+        """Bezpečné ukončení: zastaví tón i řeč a uvolní mixer.
 
         Volá se z GUI vlákna při zavírání aplikace (až po skutečném
         dokončení pracovních vláken – viz ``shutdown.py`` v E5).
@@ -201,6 +228,8 @@ class AudioCoordinator(QObject):
             return False
         if not 0.0 <= volume <= 1.0:
             raise ValueError(f"hlasitost musí být v [0, 1], dostávám {volume}")
+        # Vzájemné vyloučení: nový tón zastaví případnou hrající řeč.
+        self._halt_speech()
         self._cancel_fade_timer()
         self._generation += 1
         generation = self._generation
@@ -235,7 +264,7 @@ class AudioCoordinator(QObject):
         self.tone_stopped.emit()
 
     def stop_now(self) -> None:
-        """Okamžité bezpečné zastavení tónu (bez doběhu)."""
+        """Okamžité bezpečné zastavení tónu i řeči (bez doběhu)."""
         self._cancel_fade_timer()
         self._generation += 1
         was_playing = self._state is AudioState.TONE
@@ -244,9 +273,131 @@ class AudioCoordinator(QObject):
                 self._channel.stop()
             except Exception:
                 pass
+        self._halt_speech()
         self._state = AudioState.IDLE
         if was_playing:
             self.tone_stopped.emit()
+
+    # ------------------------------------------------------------------
+    # Řeč (E4) – pygame.mixer.music výhradně zde
+    # ------------------------------------------------------------------
+
+    def play_speech(self, request_id: int, data: bytes, volume: float = 1.0) -> bool:
+        """Přehraje kompletní MP3 data z ``SpeechWorker``.
+
+        Nejprve zastaví aktivní tón, pak načte data přes
+        ``music.load(io.BytesIO(data), namehint="mp3")`` a spustí
+        přehrávání. Přechod do stavu ``SPEECH``; konec hlídá poll
+        časovač s ``get_busy()`` a generační číslem.
+
+        Při chybě dekódování/přehrávání emituje ``speech_failed``
+        (s ID požadavku), vrátí ``False`` a nic nepředstírá.
+        """
+        if not self._available:
+            self.speech_failed.emit(
+                request_id, self._error_message or "Zvuk není dostupný."
+            )
+            return False
+        if not 0.0 <= volume <= 1.0:
+            raise ValueError(f"hlasitost musí být v [0, 1], dostávám {volume}")
+        if not data:
+            self.speech_failed.emit(request_id, "Prázdná MP3 data.")
+            return False
+
+        # Vzájemné vyloučení: řeč zastaví případný tón.
+        self._cancel_fade_timer()
+        self._generation += 1
+        generation = self._generation
+        tone_was_active = self._state is AudioState.TONE
+        if tone_was_active:
+            try:
+                self._channel.stop()
+            except Exception:
+                pass
+        self._halt_speech()   # předchozí řeč (byť jakákoli) zastavit
+
+        try:
+            # Životnost streamu: referenci držíme po dobu přehrávání.
+            stream = io.BytesIO(data)
+            self._music.load(stream, namehint="mp3")
+            self._music.set_volume(volume)
+            self._music.play()
+        except Exception as exc:
+            self._speech_stream = None
+            self._state = AudioState.IDLE
+            if tone_was_active:
+                self.tone_stopped.emit()
+            self.speech_failed.emit(request_id, f"Chyba přehrávání řeči: {exc}")
+            return False
+
+        self._speech_stream = stream
+        self._speech_request_id = request_id
+        self._state = AudioState.SPEECH
+        if tone_was_active:
+            self.tone_stopped.emit()
+        self._start_speech_poll(generation)
+        return True
+
+    def stop_speech(self) -> None:
+        """Okamžitě zastaví právě hrající řeč (bez čekání na generování).
+
+        Tón, který uživatel mezitím stihl spustit, **nezastavuje**
+        (stav není ``SPEECH`` → no-op). Žádný signál se neodesílá –
+        o zneplatnění požadavku se stará ``MainWindow`` podle ID.
+        """
+        if self._state is not AudioState.SPEECH:
+            return  # tón se při zastavení řeči nesmí rušit
+        self._generation += 1           # staré callbacky jsou neplatné
+        self._halt_speech()
+        self._state = AudioState.IDLE
+
+    def _halt_speech(self) -> None:
+        """Zastaví music, ruší poll časovač a uvolní reference.
+
+        NESAHEJ na stav ani na generaci – to řídí volající. Nikdy
+        neemituje signály (volá se i při zastavení tónu).
+        """
+        timer = self._speech_timer
+        self._speech_timer = None
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        try:
+            # Bezpečné i když nic nehraje; kanál tónu to neovlivní.
+            self._music.stop()
+        except Exception:
+            pass
+        self._speech_stream = None      # BytesIO může skončit
+        self._speech_request_id = None
+
+    def _start_speech_poll(self, generation: int) -> None:
+        """Spuštění neblokujícího pollingu konce přehrávání."""
+        timer = self._timer_factory()
+        timer.setSingleShot(False)
+        timer.timeout.connect(lambda: self._speech_tick(generation))
+        self._speech_timer = timer
+        timer.start(SPEECH_POLL_MS)
+
+    def _speech_tick(self, generation: int) -> None:
+        """Jedna kontrola ``get_busy()``; zastaralé generace no-op."""
+        if generation != self._generation or self._state is not AudioState.SPEECH:
+            return  # zastaralý callback nesmí změnit stav novějšího přehrávání
+        try:
+            busy = bool(self._music.get_busy())
+        except Exception:
+            busy = False
+        if busy:
+            if self._speech_timer is not None:
+                self._speech_timer.start(SPEECH_POLL_MS)
+            return
+        # Konce přehrávání: dokončit podle ID tehdy platného požadavku.
+        request_id = self._speech_request_id
+        self._halt_speech()
+        self._state = AudioState.IDLE
+        if request_id is not None:
+            self.speech_finished.emit(request_id)
 
     # ------------------------------------------------------------------
     # Náběh (fade-in)

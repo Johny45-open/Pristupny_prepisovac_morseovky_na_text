@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 
 import pytest
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QPushButton, QTextEdit
 
@@ -27,6 +27,34 @@ def qapp():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = QApplication.instance() or QApplication([])
     yield app
+
+
+class _IdleSignals(QObject):
+    completed = pyqtSignal(int, bytes)
+    error = pyqtSignal(int, str)
+    interrupted = pyqtSignal(int)
+
+
+class IdleSpeechWorker(QThread):
+    """Fake hlasového pracovníka: nic negeneruje, žádná síť.
+
+    E3 testy klikají na „Dokončit zprávu a přečíst“ (E4 změnilo
+    chování tlačítka); bez tohoto faku by vznikl skutečný gTTS
+    požadavek. Vlákno skončí okamžitě, rozhraní zůstane stejné.
+    """
+
+    def __init__(self, request_id: int, text: str, cache=None, parent=None) -> None:
+        super().__init__(parent)
+        self.request_id = request_id
+        self.text = text
+        self.signals = _IdleSignals()
+
+    def run(self) -> None:  # nic nedělá – žádná síť
+        pass
+
+
+def idle_speech_factory(request_id: int, text: str, cache) -> IdleSpeechWorker:
+    return IdleSpeechWorker(request_id, text, cache)
 
 
 class FakeCoordinator:
@@ -92,7 +120,12 @@ def window(qapp):
     coordinator = FakeCoordinator()
     output = FakeOutput()
     announcer = Announcer(output=output, clock=lambda: 0.0)
-    win = MainWindow(settings=settings, coordinator=coordinator, announcer=announcer)
+    win = MainWindow(
+        settings=settings,
+        coordinator=coordinator,
+        announcer=announcer,
+        speech_factory=idle_speech_factory,   # žádná síť v E3 testech
+    )
     win.output = output
     win.coordinator = coordinator
     win.show()
